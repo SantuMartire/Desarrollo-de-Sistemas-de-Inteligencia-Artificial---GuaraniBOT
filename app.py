@@ -16,11 +16,13 @@ import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
 
+from embeddings import calcular_embeddings
+
 load_dotenv()
 
 # --- Configuración ---
 MODELO = "llama-3.3-70b-versatile"   # podés probar "llama-3.1-8b-instant" (más rápido)
-K_FRAGMENTOS = 4                      # cuántos fragmentos recuperar por pregunta
+K_FRAGMENTOS = 8                      # cuántos fragmentos recuperar por pregunta
 
 SYSTEM_PROMPT = """Sos un asistente que ayuda a resolver un problema concreto.
 Respondé SIEMPRE en español, de forma clara, ordenada y concreta.
@@ -36,17 +38,34 @@ Reglas:
 
 @st.cache_resource
 def cargar_recursos():
-    """Inicializa Groq y la colección de ChromaDB una sola vez."""
+    """Inicializa Groq y el cliente de ChromaDB una sola vez."""
     groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
     chroma = chromadb.PersistentClient(path="./chroma_db")
+    return groq, chroma
+
+
+def recuperar(chroma, pregunta: str, k: int) -> list[dict]:
+    """Devuelve los k fragmentos más parecidos a la pregunta, con su fuente.
+
+    Cada elemento es un dict {"texto": ..., "fuente": ...}, donde "fuente" es
+    el archivo del que salió el fragmento (documento.md, calendario, etc.).
+
+    Buscamos la colección por nombre en cada consulta (en vez de cachear el
+    objeto) porque al reindexar con ingest.py la colección se borra y se vuelve
+    a crear con otro id interno. Si cacheáramos el objeto, quedaría apuntando a
+    una colección que ya no existe y la app rompería hasta reiniciarla.
+    """
     coleccion = chroma.get_collection(name="documento")
-    return groq, coleccion
-
-
-def recuperar(coleccion, pregunta: str, k: int) -> list[str]:
-    """Devuelve los k fragmentos más parecidos a la pregunta."""
-    res = coleccion.query(query_texts=[pregunta], n_results=k)
-    return res["documents"][0]
+    # Embebemos la pregunta con el MISMO modelo con que indexamos (ver
+    # embeddings.py) y buscamos por ese vector.
+    vector_pregunta = calcular_embeddings([pregunta])[0]
+    res = coleccion.query(query_embeddings=[vector_pregunta], n_results=k)
+    documentos = res["documents"][0]
+    metadatos = res["metadatas"][0]
+    return [
+        {"texto": doc, "fuente": meta.get("fuente", "desconocida")}
+        for doc, meta in zip(documentos, metadatos)
+    ]
 
 
 # --- Interfaz ---
@@ -54,7 +73,7 @@ st.set_page_config(page_title="Asistente", page_icon="🤖")
 st.title("🤖 Asistente del proyecto")
 st.caption("Respuestas basadas en tu documento + conocimiento general del modelo.")
 
-groq, coleccion = cargar_recursos()
+groq, chroma = cargar_recursos()
 
 if "mensajes" not in st.session_state:
     st.session_state.mensajes = []
@@ -69,9 +88,11 @@ if pregunta := st.chat_input("Escribí tu pregunta..."):
     with st.chat_message("user"):
         st.markdown(pregunta)
 
-    # 1) Recuperar contexto de tu documento
-    fragmentos = recuperar(coleccion, pregunta, K_FRAGMENTOS)
-    contexto = "\n\n---\n\n".join(fragmentos)
+    # 1) Recuperar contexto de tus documentos (con la fuente de cada fragmento)
+    fragmentos = recuperar(chroma, pregunta, K_FRAGMENTOS)
+    contexto = "\n\n---\n\n".join(
+        f"[Fuente: {f['fuente']}]\n{f['texto']}" for f in fragmentos
+    )
 
     # 2) Armar el mensaje para el modelo
     mensaje_usuario = (
@@ -98,4 +119,6 @@ if pregunta := st.chat_input("Escribí tu pregunta..."):
     # (Opcional) mostrar qué fragmentos se usaron, para tu defensa/demostración
     with st.expander("Ver fragmentos del documento usados"):
         for i, frag in enumerate(fragmentos, 1):
-            st.markdown(f"**Fragmento {i}:** {frag}")
+            st.markdown(
+                f"**Fragmento {i}** — _fuente: {frag['fuente']}_\n\n{frag['texto']}"
+            )

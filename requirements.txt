@@ -2,3 +2,4 @@ groq
 streamlit
 chromadb
 python-dotenv
+fastembed
